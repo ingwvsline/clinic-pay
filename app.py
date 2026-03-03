@@ -47,6 +47,26 @@ def extract_appr_numbers(text):
     if pd.isna(text): return []
     return re.findall(r'\b\d{8}\b', str(text))
 
+def chart_similarity(a, b):
+    """차트번호 유사도(0~1)."""
+    a, b = clean_no(a), clean_no(b)
+    if a == '-' or b == '-':
+        return 0.0
+    if a == b:
+        return 1.0
+    max_len = max(len(a), len(b))
+    if max_len == 0:
+        return 0.0
+    # 앞/뒤가 같고 일부 숫자만 다른 오기 가능성에 가중치
+    common_prefix = len(list(itertools.takewhile(lambda x: x[0] == x[1], zip(a, b))))
+    common_suffix = len(list(itertools.takewhile(lambda x: x[0] == x[1], zip(a[::-1], b[::-1]))))
+    return min(1.0, (common_prefix + common_suffix) / max_len)
+
+def normalize_name(x):
+    if pd.isna(x):
+        return ''
+    return re.sub(r'\s+', '', str(x)).strip()
+
 if file_hansol and file_daily and file_patient:
     
     if st.button("🚀 정산 데이터 분석 시작하기", type="primary"):
@@ -94,7 +114,7 @@ if file_hansol and file_daily and file_patient:
             if '승인번호' in df_p.columns:
                 df_p['추출된_승인번호리스트'] = df_p['승인번호'].apply(lambda x: [clean_no(i) for i in str(x).replace(' ', '').split(',') if clean_no(i) != '-'])
             elif '결제메모' in df_p.columns:
-                df_p['추출된_승인번호리스트'] = df_p['결제메메모'].apply(extract_appr_numbers)
+                df_p['추출된_승인번호리스트'] = df_p['결제메모'].apply(extract_appr_numbers)
 
             appr_to_chart = {}
             for _, row in df_p.iterrows():
@@ -119,6 +139,7 @@ if file_hansol and file_daily and file_patient:
             matches = []
             matched_h, matched_d = set(), set()
             h_to_chart = {}
+            df_d_card['정규이름'] = df_d_card['성명'].apply(normalize_name)
 
             # 승인번호 Direct 매칭
             for idx, h_row in df_h.iterrows():
@@ -141,13 +162,86 @@ if file_hansol and file_daily and file_patient:
                     h_to_chart[h_sub.iloc[i]['Hansol_ID']] = d_sub.iloc[i]['차트번호']
                     matches.append({'상태': '✅ 금액매칭', '차트번호': d_sub.iloc[i]['차트번호'], '환자명': d_sub.iloc[i]['성명'], '[일마]금액': amt, '[한솔]금액': amt, '비고': '금액 일치'})
 
+            # 이름 동일 + 차트번호 유사 -> 차트번호 오기 의심 매칭
+            rem_h = df_h[~df_h['Hansol_ID'].isin(matched_h)]
+            rem_d = df_d_card[~df_d_card['index'].isin(matched_d)].copy()
+            for _, d_row in rem_d.iterrows():
+                d_name = d_row['정규이름']
+                if not d_name:
+                    continue
+                h_cands = rem_h[rem_h['금액'] == d_row['카드']]
+                if h_cands.empty:
+                    continue
+                name_cols = [c for c in ['구매자명', '고객명', '이름', '성명'] if c in df_h.columns]
+                for _, h_row in h_cands.iterrows():
+                    if name_cols:
+                        h_name = normalize_name(h_row[name_cols[0]])
+                        if h_name and h_name != d_name:
+                            continue
+                    # 한솔 메모/가맹점명 등에서 차트번호 단서 추출
+                    text_blob = ' '.join([str(h_row.get(c, '')) for c in ['구매자명', '거래내용', '가맹점명', '비고'] if c in df_h.columns])
+                    nums = re.findall(r'\d{4,}', text_blob)
+                    if not nums:
+                        continue
+                    sim = max([chart_similarity(d_row['차트번호'], n) for n in nums], default=0)
+                    if sim >= 0.6:
+                        matched_h.add(h_row['Hansol_ID']); matched_d.add(d_row['index'])
+                        h_to_chart[h_row['Hansol_ID']] = d_row['차트번호']
+                        matches.append({
+                            '상태': '⚠️ 차트번호 오기 의심(추정매칭)',
+                            '차트번호': d_row['차트번호'],
+                            '환자명': d_row['성명'],
+                            '[일마]금액': d_row['카드'],
+                            '[한솔]금액': h_row['금액'],
+                            '비고': f'이름 동일 + 차트번호 유사도 {sim:.2f}'
+                        })
+                        break
+
+            # 일마 입력 순서와 한솔 시간 순서를 이용한 추정 매칭
+            rem_h = df_h[~df_h['Hansol_ID'].isin(matched_h)].copy()
+            rem_d = df_d_card[~df_d_card['index'].isin(matched_d)].copy()
+            time_cols = [c for c in ['거래일시', '승인일시', '결제일시', '시간'] if c in rem_h.columns]
+            if time_cols:
+                rem_h['_sort_ts'] = pd.to_datetime(rem_h[time_cols[0]], errors='coerce')
+                rem_h = rem_h.sort_values(['_sort_ts', 'Hansol_ID']).reset_index(drop=True)
+            else:
+                rem_h = rem_h.sort_values('Hansol_ID').reset_index(drop=True)
+            rem_d = rem_d.sort_values('index').reset_index(drop=True)
+
+            i, j = 0, 0
+            while i < len(rem_h) and j < len(rem_d):
+                h_row = rem_h.iloc[i]
+                d_row = rem_d.iloc[j]
+                if h_row['금액'] == d_row['카드']:
+                    matched_h.add(h_row['Hansol_ID']); matched_d.add(d_row['index'])
+                    h_to_chart[h_row['Hansol_ID']] = d_row['차트번호']
+                    matches.append({
+                        '상태': '🟡 순서기반 추정매칭',
+                        '차트번호': d_row['차트번호'],
+                        '환자명': d_row['성명'],
+                        '[일마]금액': d_row['카드'],
+                        '[한솔]금액': h_row['금액'],
+                        '비고': '일마 입력순서 ↔ 한솔 시간순서 기반'
+                    })
+                    i += 1
+                    j += 1
+                elif h_row['금액'] < d_row['카드']:
+                    i += 1
+                else:
+                    j += 1
+
+            match_df = pd.DataFrame(matches)
+
             # === 탭 구성 ===
             tab1, tab2, tab3 = st.tabs(["💳 [한솔] vs [일마]", "🏥 [차트] vs [한솔] (다이렉트)", "📊 [차트] vs [일마] (수단별 분석)"])
             
             with tab1:
                 st.subheader("카드 승인 대사 (의심 거래)")
-                # 미매칭 한솔/일마 정리 (생략)
-                st.write("차액 및 누락 건 리스트...") # 결과 데이터프레임 출력 부분
+                st.caption("추정매칭(차트번호 오기 의심/순서기반)은 승인번호 직접매칭보다 신뢰도가 낮습니다.")
+                if not match_df.empty:
+                    st.dataframe(match_df.sort_values(['상태', '차트번호']))
+                else:
+                    st.success("매칭 결과가 없습니다.")
 
             with tab2:
                 st.subheader("🏥 [차트] 카드수납액 vs [한솔] 실제승인액")
@@ -171,7 +265,7 @@ if file_hansol and file_daily and file_patient:
                 final_merge['카드차이'] = final_merge['[일마] 카드'] - final_merge['[차트] 카드']
                 final_merge['현금차이'] = final_merge['[일마] 현금'] - final_merge['[차트] 현금']
                 final_merge['이체차이'] = final_merge['[일마] 이체'] - final_merge['[차트] 이체']
-                final_merge['플랫폼차이'] = final_merge['[일마] 플랫폼'] - final_merge['[차트] 플랫폼(기타)']
+                final_merge['플랫폼차이'] = final_merge['[일마] 플랫폼'] - final_merge['[차트] 플랫폼']
                 
                 # 구체적 분석 메시지
                 def get_detail_reason(row):
