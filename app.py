@@ -47,6 +47,25 @@ def extract_appr_numbers(text):
     if pd.isna(text): return []
     return re.findall(r'\b\d{8}\b', str(text))
 
+def classify_payment_method(method, memo):
+    """차트 결제수단을 카드/현금/이체/플랫폼으로 분류"""
+    method_txt = str(method) if not pd.isna(method) else ''
+    memo_txt = str(memo) if not pd.isna(memo) else ''
+    combined_txt = f"{method_txt} {memo_txt}"
+
+    if re.search(r'카드', method_txt):
+        return '카드'
+    if re.search(r'현금', method_txt):
+        return '현금'
+    if re.search(r'통장|이체', method_txt):
+        return '이체'
+
+    # '기타(기타)'는 메모 정보가 없어도 플랫폼 결제로 간주
+    if re.search(r'기타\s*\(\s*기타\s*\)|강남|강언|여신|닥터|플랫폼', combined_txt):
+        return '플랫폼'
+
+    return '기타'
+
 if file_hansol and file_daily and file_patient:
     
     if st.button("🚀 정산 데이터 분석 시작하기", type="primary"):
@@ -83,18 +102,15 @@ if file_hansol and file_daily and file_patient:
             df_p['[차트] 총수납액'] = df_p[calc_cols].sum(axis=1) if calc_cols else 0
             
             # 결제수단별 분류 (카드/현금/이체/플랫폼)
-            df_p['분류'] = '기타'
-            df_p.loc[df_p['결제수단'].astype(str).str.contains('카드'), '분류'] = '카드'
-            df_p.loc[df_p['결제수단'].astype(str).str.contains('현금'), '분류'] = '현금'
-            df_p.loc[df_p['결제수단'].astype(str).str.contains('통장|이체'), '분류'] = '이체'
-            df_p.loc[df_p['결제수단'].astype(str).str.contains('기타|강남|여신|닥터'), '분류'] = '플랫폼'
+            memo_series = df_p['결제메모'] if '결제메모' in df_p.columns else pd.Series('', index=df_p.index)
+            df_p['분류'] = [classify_payment_method(m, mm) for m, mm in zip(df_p['결제수단'], memo_series)]
 
             # 승인번호 추출
             df_p['추출된_승인번호리스트'] = [[] for _ in range(len(df_p))]
             if '승인번호' in df_p.columns:
                 df_p['추출된_승인번호리스트'] = df_p['승인번호'].apply(lambda x: [clean_no(i) for i in str(x).replace(' ', '').split(',') if clean_no(i) != '-'])
             elif '결제메모' in df_p.columns:
-                df_p['추출된_승인번호리스트'] = df_p['결제메메모'].apply(extract_appr_numbers)
+                df_p['추출된_승인번호리스트'] = df_p['결제메모'].apply(extract_appr_numbers)
 
             appr_to_chart = {}
             for _, row in df_p.iterrows():
@@ -171,7 +187,7 @@ if file_hansol and file_daily and file_patient:
                 final_merge['카드차이'] = final_merge['[일마] 카드'] - final_merge['[차트] 카드']
                 final_merge['현금차이'] = final_merge['[일마] 현금'] - final_merge['[차트] 현금']
                 final_merge['이체차이'] = final_merge['[일마] 이체'] - final_merge['[차트] 이체']
-                final_merge['플랫폼차이'] = final_merge['[일마] 플랫폼'] - final_merge['[차트] 플랫폼(기타)']
+                final_merge['플랫폼차이'] = final_merge['[일마] 플랫폼'] - final_merge['[차트] 플랫폼']
                 
                 # 구체적 분석 메시지
                 def get_detail_reason(row):
@@ -185,5 +201,5 @@ if file_hansol and file_daily and file_patient:
                 final_merge['💡 상세 불일치 수단'] = final_merge.apply(get_detail_reason, axis=1)
                 
                 st.dataframe(final_merge[final_merge['💡 상세 불일치 수단'] != "✅ 일치"][
-                    ['차트번호', '성명', '💡 상세 불일치 수단', '[일마] 카드', '[차트] 카드', '[일마] 현금', '[차트] 현금', '[일마] 이체', '[차트] 이체']
+                    ['차트번호', '성명', '💡 상세 불일치 수단', '[일마] 카드', '[차트] 카드', '[일마] 현금', '[차트] 현금', '[일마] 이체', '[차트] 이체', '[일마] 플랫폼', '[차트] 플랫폼']
                 ])
